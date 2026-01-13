@@ -28,11 +28,11 @@ and secure.
 .. note::
    When **OAUTH2_SERVER_METADATA_URL** is configured, pgAdmin treats the provider
    as an OIDC provider and will:
-   
+
    - Use ID token claims for user identity (sub, email, preferred_username)
    - Skip the userinfo endpoint call when ID token contains sufficient information
    - Validate the ID token automatically using the provider's public keys
-   
+
    This is the **recommended approach** for modern identity providers like
    Microsoft Entra ID (Azure AD), Google, Keycloak, Auth0, and Okta.
 
@@ -55,6 +55,8 @@ and secure.
     "OAUTH2_DISPLAY_NAME", "Oauth2 display name in pgAdmin"
     "OAUTH2_CLIENT_ID", "Oauth2 Client ID"
     "OAUTH2_CLIENT_SECRET", "Oauth2 Client Secret. **Optional for public clients using Authorization Code + PKCE**. For confidential clients (server-side apps), keep this set. For public clients (no secret), pgAdmin will enforce PKCE and perform an unauthenticated token exchange."
+    "OAUTH2_CLIENT_AUTH_METHOD", "Client authentication method for the token endpoint. Default behavior uses *OAUTH2_CLIENT_SECRET* (confidential client), or PKCE when no secret is provided (public client). Set to *workload_identity* to authenticate using an Azure Entra ID workload identity (federated credential) without a client secret."
+    "OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE", "When **OAUTH2_CLIENT_AUTH_METHOD** is *workload_identity*, path to the projected OIDC token file (Kubernetes service account JWT). This file must exist at pgAdmin startup."
     "OAUTH2_TOKEN_URL", "Oauth2 Access Token endpoint"
     "OAUTH2_AUTHORIZATION_URL", "Endpoint for user authorization"
     "OAUTH2_SERVER_METADATA_URL", "**OIDC Discovery URL** (recommended for OIDC providers). When set, pgAdmin will use OIDC flow with automatic ID token validation and user claims from the ID token. Example: *https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration*. When using this parameter, OAUTH2_TOKEN_URL and OAUTH2_AUTHORIZATION_URL are optional as they will be discovered automatically."
@@ -123,6 +125,95 @@ pgAdmin supports interactive user login for both client types:
     For public clients, pgAdmin uses Authlib's native behavior to perform an **unauthenticated token exchange**
     (token endpoint client authentication method: ``none``). This is required for Authorization Code + PKCE
     flows where no client secret is available.
+
+Azure Entra ID Workload Identity (AKS) (No Client Secret)
+========================================================
+
+pgAdmin can authenticate to Microsoft Entra ID (Azure AD) **without a client secret** using an
+AKS Workload Identity projected service account token (OIDC federated credential).
+
+This is a **confidential client** scenario (server-side app), but client authentication to the token
+endpoint is performed using a **JWT client assertion**.
+
+Enable workload identity mode
+-----------------------------
+
+Set the following parameters in your provider configuration:
+
+.. code-block:: python
+
+    OAUTH2_CONFIG = [{
+        'OAUTH2_NAME': 'entra-workload-identity',
+        'OAUTH2_DISPLAY_NAME': 'Microsoft Entra ID',
+        'OAUTH2_CLIENT_ID': '<Application (client) ID>',
+        'OAUTH2_CLIENT_SECRET': None,  # not required
+        'OAUTH2_CLIENT_AUTH_METHOD': 'workload_identity',
+        'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE':
+            '/var/run/secrets/azure/tokens/azure-identity-token',
+        'OAUTH2_SERVER_METADATA_URL':
+            'https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration',
+        'OAUTH2_SCOPE': 'openid email profile',
+    }]
+
+With this configuration:
+
+- pgAdmin will **not** require **OAUTH2_CLIENT_SECRET**.
+- pgAdmin will **not** use PKCE for this provider.
+- During the token exchange, pgAdmin will send:
+
+    - ``client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer``
+    - ``client_assertion=<projected service account JWT>``
+
+Azure App Registration setup
+----------------------------
+
+In Microsoft Entra ID:
+
+- Create an **App registration** for pgAdmin.
+- Configure a **Redirect URI** to ``<http/https>://<pgAdmin Server URL>/oauth2/authorize``.
+- In **Certificates & secrets**, you do **not** need to create a client secret for workload identity.
+
+Federated credential (workload identity) configuration
+------------------------------------------------------
+
+Add a **Federated credential** to the App registration:
+
+- **Issuer**: your AKS cluster OIDC issuer URL.
+- **Subject**: ``system:serviceaccount:<namespace>:<serviceaccount-name>``
+- **Audience**: typically ``api://AzureADTokenExchange``
+
+AKS ServiceAccount example
+--------------------------
+
+Example ServiceAccount for AKS Workload Identity:
+
+.. code-block:: yaml
+
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+            name: pgadmin
+            namespace: pgadmin
+            annotations:
+                azure.workload.identity/client-id: "<Application (client) ID>"
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+            name: pgadmin
+            namespace: pgadmin
+        spec:
+            template:
+                metadata:
+                    labels:
+                        azure.workload.identity/use: "true"
+                spec:
+                    serviceAccountName: pgadmin
+
+.. note::
+    The projected token file path can vary by cluster configuration.
+    In many AKS setups it is provided via the ``AZURE_FEDERATED_TOKEN_FILE`` environment
+    variable and mounted under ``/var/run/secrets/azure/tokens/``.
 
 OIDC Configuration Examples
 ============================

@@ -11,7 +11,7 @@ import config as app_config
 from pgadmin.utils.route import BaseTestGenerator
 from regression.python_test_utils import test_utils as utils
 from pgadmin.authenticate.registry import AuthSourceRegistry
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 from pgadmin.utils.constants import OAUTH2, INTERNAL
 from flask import current_app, redirect
 
@@ -62,6 +62,24 @@ class Oauth2LoginMockTestCase(BaseTestGenerator):
         ('Oauth2 Invalid Public Client Config', dict(
             oauth2_provider='invalid-public',
             kind='invalid_public_no_pkce',
+            profile={},
+            id_token_claims=None,
+        )),
+        ('Oauth2 Workload Identity Registration', dict(
+            oauth2_provider='workload-identity',
+            kind='workload_identity_registration',
+            profile={},
+            id_token_claims=None,
+        )),
+        ('Oauth2 Workload Identity Client Assertion', dict(
+            oauth2_provider='workload-identity',
+            kind='workload_identity_client_assertion',
+            profile={},
+            id_token_claims=None,
+        )),
+        ('Oauth2 Workload Identity Missing Token File', dict(
+            oauth2_provider='workload-identity',
+            kind='workload_identity_missing_token_file',
             profile={},
             id_token_claims=None,
         )),
@@ -263,6 +281,12 @@ class Oauth2LoginMockTestCase(BaseTestGenerator):
             self._test_confidential_client_registration_unchanged()
         elif self.kind == 'invalid_public_no_pkce':
             self._test_public_client_missing_pkce_fails_fast()
+        elif self.kind == 'workload_identity_registration':
+            self._test_workload_identity_registration()
+        elif self.kind == 'workload_identity_client_assertion':
+            self._test_workload_identity_client_assertion()
+        elif self.kind == 'workload_identity_missing_token_file':
+            self._test_workload_identity_missing_token_file_fails_fast()
         elif self.kind == 'login_success':
             self._test_oauth2_login_success(
                 self.oauth2_provider, self.profile, self.id_token_claims
@@ -551,6 +575,123 @@ class Oauth2LoginMockTestCase(BaseTestGenerator):
             profile = oauth.get_user_profile()
             self.assertEqual(profile.get('email'), 'userinfo@example.com')
             client.get.assert_called_once()
+
+    def _test_workload_identity_registration(self):
+        """Workload identity must register without client secret or PKCE."""
+
+        app_config.OAUTH2_CONFIG = [{
+            'OAUTH2_NAME': 'workload-identity',
+            'OAUTH2_DISPLAY_NAME': 'Workload Identity',
+            'OAUTH2_CLIENT_ID': 'testclientid',
+            'OAUTH2_CLIENT_SECRET': None,
+            'OAUTH2_CLIENT_AUTH_METHOD': 'workload_identity',
+            'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE': (
+                '/var/run/secrets/tokens/oidc'
+            ),
+            'OAUTH2_TOKEN_URL': 'https://entra.example/token',
+            'OAUTH2_AUTHORIZATION_URL': 'https://entra.example/auth',
+            'OAUTH2_SCOPE': 'openid email profile',
+            'OAUTH2_SERVER_METADATA_URL':
+                'https://entra.example/.well-known/openid-configuration',
+        }]
+
+        with patch(
+            'pgadmin.authenticate.oauth2.OAuth.register'
+        ) as mock_register, patch(
+            'pgadmin.authenticate.oauth2.os.path.isfile', return_value=True
+        ):
+            from pgadmin.authenticate.oauth2 import OAuth2Authentication
+
+            OAuth2Authentication()
+
+            kwargs = self._get_register_kwargs(
+                mock_register, 'workload-identity'
+            )
+            self.assertEqual(kwargs.get('token_endpoint_auth_method'), 'none')
+            self.assertIsNone(kwargs.get('client_secret'))
+
+            client_kwargs = kwargs.get('client_kwargs', {})
+            self.assertNotIn('code_challenge_method', client_kwargs)
+            self.assertNotIn('response_type', client_kwargs)
+
+    def _test_workload_identity_client_assertion(self):
+        """Token exchange must include client_assertion fields."""
+
+        app_config.OAUTH2_CONFIG = [{
+            'OAUTH2_NAME': 'workload-identity',
+            'OAUTH2_DISPLAY_NAME': 'Workload Identity',
+            'OAUTH2_CLIENT_ID': 'testclientid',
+            'OAUTH2_CLIENT_SECRET': None,
+            'OAUTH2_CLIENT_AUTH_METHOD': 'workload_identity',
+            'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE': (
+                '/var/run/secrets/tokens/oidc'
+            ),
+            'OAUTH2_TOKEN_URL': 'https://entra.example/token',
+            'OAUTH2_AUTHORIZATION_URL': 'https://entra.example/auth',
+            'OAUTH2_SCOPE': 'openid email profile',
+            'OAUTH2_SERVER_METADATA_URL':
+                'https://entra.example/.well-known/openid-configuration',
+        }]
+
+        client = MagicMock()
+        client.authorize_access_token = MagicMock(return_value={
+            'access_token': 't',
+            'token_type': 'Bearer',
+            'userinfo': {'email': 'wi@example.com', 'sub': 'abc'}
+        })
+
+        with patch(
+            'pgadmin.authenticate.oauth2.OAuth.register', return_value=client
+        ), patch(
+            'pgadmin.authenticate.oauth2.os.path.isfile', return_value=True
+        ), patch(
+            'builtins.open', mock_open(read_data='projected.jwt.token\n')
+        ):
+            from pgadmin.authenticate.oauth2 import OAuth2Authentication
+
+            with self.app.test_request_context('/'):
+                oauth = OAuth2Authentication()
+                oauth.oauth2_current_client = 'workload-identity'
+
+                profile = oauth.get_user_profile()
+                self.assertEqual(profile.get('email'), 'wi@example.com')
+
+        client.authorize_access_token.assert_called_once_with(
+            client_assertion_type=(
+                'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            ),
+            client_assertion='projected.jwt.token'
+        )
+
+    def _test_workload_identity_missing_token_file_fails_fast(self):
+        """Workload identity must fail fast if token file missing."""
+
+        app_config.OAUTH2_CONFIG = [{
+            'OAUTH2_NAME': 'workload-identity',
+            'OAUTH2_DISPLAY_NAME': 'Workload Identity',
+            'OAUTH2_CLIENT_ID': 'testclientid',
+            'OAUTH2_CLIENT_SECRET': None,
+            'OAUTH2_CLIENT_AUTH_METHOD': 'workload_identity',
+            'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE': '/does/not/exist',
+            'OAUTH2_TOKEN_URL': 'https://entra.example/token',
+            'OAUTH2_AUTHORIZATION_URL': 'https://entra.example/auth',
+            'OAUTH2_SCOPE': 'openid email profile',
+        }]
+
+        with patch(
+            'pgadmin.authenticate.oauth2.OAuth.register'
+        ) as mock_register, patch(
+            'pgadmin.authenticate.oauth2.os.path.isfile', return_value=False
+        ):
+            from pgadmin.authenticate.oauth2 import OAuth2Authentication
+
+            with self.assertRaises(ValueError) as cm:
+                OAuth2Authentication()
+
+            self.assertIn('workload_identity', str(cm.exception))
+            self.assertIn('OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE',
+                          str(cm.exception))
+            mock_register.assert_not_called()
 
     def tearDown(self):
         self.tester.logout()

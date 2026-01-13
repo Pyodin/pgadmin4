@@ -10,6 +10,7 @@
 """A blueprint module implementing the Oauth2 authentication."""
 
 import config
+import os
 
 from authlib.integrations.flask_client import OAuth
 from flask import current_app, url_for, session, request, \
@@ -103,6 +104,10 @@ class OAuth2Authentication(BaseAuthentication):
     oauth2_config = {}
     email_keys = ['mail', 'email']
 
+    _WORKLOAD_IDENTITY_ASSERTION_TYPE = (
+        'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+    )
+
     def __init__(self):
         # Selected provider name (set during authenticate()).
         # Initializing avoids AttributeError in edge cases/tests.
@@ -111,6 +116,14 @@ class OAuth2Authentication(BaseAuthentication):
         for oauth2_config in config.OAUTH2_CONFIG:
 
             provider_name = oauth2_config.get('OAUTH2_NAME', '<unknown>')
+
+            client_auth_method = oauth2_config.get(
+                'OAUTH2_CLIENT_AUTH_METHOD', 'client_secret'
+            )
+            if not isinstance(client_auth_method, str):
+                client_auth_method = 'client_secret'
+            client_auth_method = client_auth_method.strip().lower()
+            is_workload_identity = (client_auth_method == 'workload_identity')
 
             OAuth2Authentication.oauth2_config[
                 oauth2_config['OAUTH2_NAME']] = oauth2_config
@@ -139,7 +152,46 @@ class OAuth2Authentication(BaseAuthentication):
                  raw_client_secret.strip() == '')
             )
 
-            if client_secret_is_empty and not (
+            if is_workload_identity:
+                if pkce_is_configured:
+                    raise ValueError(
+                        f'OAuth2 provider "{provider_name}" is configured '
+                        'with OAUTH2_CLIENT_AUTH_METHOD="workload_identity" '
+                        'and PKCE settings. Workload identity must not use '
+                        'PKCE; remove OAUTH2_CHALLENGE_METHOD and '
+                        'OAUTH2_RESPONSE_TYPE.'
+                    )
+
+                if not client_secret_is_empty:
+                    raise ValueError(
+                        f'OAuth2 provider "{provider_name}" is configured '
+                        'with OAUTH2_CLIENT_AUTH_METHOD="workload_identity" '
+                        'but also sets OAUTH2_CLIENT_SECRET. Remove the '
+                        'client secret when using workload identity.'
+                    )
+
+                token_file = oauth2_config.get(
+                    'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE'
+                )
+                if not isinstance(token_file, str) or token_file.strip() == '':
+                    raise ValueError(
+                        f'OAuth2 provider "{provider_name}" is configured '
+                        'with OAUTH2_CLIENT_AUTH_METHOD="workload_identity" '
+                        'but OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE is missing '
+                        'or empty.'
+                    )
+
+                expanded = os.path.expanduser(os.path.expandvars(token_file))
+                if not os.path.isfile(expanded):
+                    raise ValueError(
+                        f'OAuth2 provider "{provider_name}" is configured '
+                        'with OAUTH2_CLIENT_AUTH_METHOD="workload_identity" '
+                        'but OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE does not '
+                        'exist: '
+                        f'{expanded}'
+                    )
+
+            if client_secret_is_empty and not is_workload_identity and not (
                 pkce_is_configured and
                 pkce_method and
                 pkce_response_type == 'code'
@@ -180,6 +232,56 @@ class OAuth2Authentication(BaseAuthentication):
             OAuth2Authentication.oauth2_clients[
                 oauth2_config['OAUTH2_NAME']
             ] = OAuth2Authentication.oauth_obj.register(**register_kwargs)
+
+    def _read_workload_identity_assertion(self, provider_name, provider):
+        token_file = provider.get('OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE')
+        if not isinstance(token_file, str) or token_file.strip() == '':
+            raise ValueError(
+                f'OAuth2 provider "{provider_name}" is configured '
+                'for workload identity but '
+                'OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE is missing or empty.'
+            )
+
+        expanded = os.path.expanduser(os.path.expandvars(token_file))
+        if not os.path.isfile(expanded):
+            raise ValueError(
+                f'OAuth2 provider "{provider_name}" workload identity '
+                'token file (OAUTH2_WORKLOAD_IDENTITY_TOKEN_FILE) does not '
+                'exist: '
+                f'{expanded}'
+            )
+
+        with open(expanded, 'r', encoding='utf-8') as fp:
+            token = fp.read().strip()
+
+        if not token:
+            raise ValueError(
+                f'OAuth2 provider "{provider_name}" workload identity '
+                'token file is empty.'
+            )
+
+        return token
+
+    def _authorize_access_token(self, provider_name, provider, client):
+        client_auth_method = provider.get(
+            'OAUTH2_CLIENT_AUTH_METHOD', 'client_secret'
+        )
+        if isinstance(client_auth_method, str):
+            client_auth_method = client_auth_method.strip().lower()
+        else:
+            client_auth_method = 'client_secret'
+
+        if client_auth_method != 'workload_identity':
+            return client.authorize_access_token()
+
+        assertion = self._read_workload_identity_assertion(
+            provider_name, provider
+        )
+
+        return client.authorize_access_token(
+            client_assertion_type=self._WORKLOAD_IDENTITY_ASSERTION_TYPE,
+            client_assertion=assertion
+        )
 
     def get_source_name(self):
         return OAUTH2
@@ -476,8 +578,12 @@ class OAuth2Authentication(BaseAuthentication):
         return False, msg
 
     def get_user_profile(self):
-        session['oauth2_token'] = self.oauth2_clients[
-            self.oauth2_current_client].authorize_access_token()
+        provider = self.oauth2_config.get(self.oauth2_current_client, {})
+        client = self.oauth2_clients[self.oauth2_current_client]
+
+        session['oauth2_token'] = self._authorize_access_token(
+            self.oauth2_current_client, provider, client
+        )
 
         session['pass_enc_key'] = session['oauth2_token']['access_token']
 
